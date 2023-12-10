@@ -36,6 +36,7 @@ import (
 	"github.com/minio/minio-go/v7/pkg/notification"
 	"github.com/minio/minio-go/v7/pkg/replication"
 	"github.com/minio/pkg/v2/console"
+	"github.com/charmbracelet/bubbletea"
 )
 
 // contentMessage container for content message structure.
@@ -54,20 +55,26 @@ type statMessage struct {
 	VersionID         string             `json:"versionID,omitempty"`
 	DeleteMarker      bool               `json:"deleteMarker,omitempty"`
 	Restore           *minio.RestoreInfo `json:"restore,omitempty"`
+	SizeModel bubbletea.Model
 }
 
 func (stat statMessage) String() (msg string) {
 	var msgBuilder strings.Builder
-	// Format properly for alignment based on maxKey leng
+	// Format properly for alignment based on maxKey length.
 	stat.Key = fmt.Sprintf("%-10s: %s", "Name", stat.Key)
 	msgBuilder.WriteString(console.Colorize("Name", stat.Key) + "\n")
-	if !stat.Date.IsZero() {
-		msgBuilder.WriteString(fmt.Sprintf("%-10s: %s ", "Date", stat.Date.Format(printDate)) + "\n")
+    if !stat.Date.IsZero() {
+        msgBuilder.WriteString(fmt.Sprintf("%-10s: %s ", "Date", stat.Date.Format(printDate)) + "\n")
+    }
+    if stat.Type != "folder" {
+        // Use Bubbletea to render size
+        p := tea.NewProgram(stat.SizeModel)
+        sizeStr, err := p.StartReturning() // Render the model and get output as string
+        if err != nil {
+            // Handle the error appropriately
+        }
+        msgBuilder.WriteString(fmt.Sprintf("%-10s: %-6s ", "Size", sizeStr) + "\n")
 	}
-	if stat.Type != "folder" {
-		msgBuilder.WriteString(fmt.Sprintf("%-10s: %-6s ", "Size", humanize.IBytes(uint64(stat.Size))) + "\n")
-	}
-
 	if stat.ETag != "" {
 		msgBuilder.WriteString(fmt.Sprintf("%-10s: %s ", "ETag", stat.ETag) + "\n")
 	}
@@ -96,12 +103,11 @@ func (stat statMessage) String() (msg string) {
 	maxKeyMetadata := 0
 	maxKeyEncrypted := 0
 	for k := range stat.Metadata {
-		// Skip encryption headers, we print them later.
 		if !strings.HasPrefix(strings.ToLower(k), serverEncryptionKeyPrefix) {
 			if len(k) > maxKeyMetadata {
 				maxKeyMetadata = len(k)
 			}
-		} else if strings.HasPrefix(strings.ToLower(k), serverEncryptionKeyPrefix) {
+		} else {
 			if len(k) > maxKeyEncrypted {
 				maxKeyEncrypted = len(k)
 			}
@@ -121,7 +127,6 @@ func (stat statMessage) String() (msg string) {
 	if maxKeyMetadata > 0 {
 		msgBuilder.WriteString(fmt.Sprintf("%-10s:", "Metadata") + "\n")
 		for k, v := range stat.Metadata {
-			// Skip encryption headers, we print them later.
 			if !strings.HasPrefix(strings.ToLower(k), serverEncryptionKeyPrefix) {
 				msgBuilder.WriteString(fmt.Sprintf("  %-*.*s: %s ", maxKeyMetadata, maxKeyMetadata, k, v) + "\n")
 			}
@@ -129,13 +134,48 @@ func (stat statMessage) String() (msg string) {
 	}
 
 	if stat.ReplicationStatus != "" {
-		msgBuilder.WriteString(fmt.Sprintf("%-10s: %s ", "Replication Status", stat.ReplicationStatus))
+		msgBuilder.WriteString(fmt.Sprintf("%-10s: %s ", "Replication Status", stat.ReplicationStatus) + "\n")
 	}
-
-	msgBuilder.WriteString("\n")
 
 	return msgBuilder.String()
 }
+
+
+func (m sizeModel) View() string {
+    // Example size categories and their respective counts
+    sizeCategories := []struct {
+        Label string
+        Count int
+    }{
+        {"<1024 B", 27295105},
+        {"1KB-1MB", 1670981490},
+        {"1MB-10MB", 1074994452},
+        // ... add other categories
+    }
+
+    // Find the maximum count to scale the bars
+    var maxCount int
+    for _, category := range sizeCategories {
+        if category.Count > maxCount {
+            maxCount = category.Count
+        }
+    }
+
+    // Build the histogram string
+    var histogramBuilder strings.Builder
+    for _, category := range sizeCategories {
+        // Calculate the bar length as a proportion of the max count
+        barLength := 50 * category.Count / maxCount // Scale to 50 characters width
+        bar := strings.Repeat("█", barLength)
+        // Optionally, add color to the bar using ANSI escape codes
+        colorBar := "\033[33m" + bar + "\033[0m" // Yellow, for example
+        // Append the formatted category line to the histogram
+        histogramBuilder.WriteString(fmt.Sprintf("%-10s %s %d\n", category.Label, colorBar, category.Count))
+    }
+
+    return histogramBuilder.String()
+}
+
 
 // JSON jsonified content message.
 func (stat statMessage) JSON() string {
@@ -172,6 +212,8 @@ func parseStat(c *ClientContent) statMessage {
 	content.ExpirationRuleID = c.ExpirationRuleID
 	content.ReplicationStatus = c.ReplicationStatus
 	content.Restore = c.Restore
+    // Initialize Bubbletea model for size
+    content.SizeModel = newSizeModel(c.Size)
 	return content
 }
 
@@ -547,3 +589,73 @@ func prettyPrintBucketMetadata(info BucketInfo) string {
 
 	return b.String()
 }
+
+// Bubbletea mod
+type sizeModel struct {
+    categories []sizeCategory
+    maxCount   int64
+}
+
+func newSizeModel(categories []sizeCategory) sizeModel {
+    maxCount := int64(0)
+    for _, c := range categories {
+        if c.Count > maxCount {
+            maxCount = c.Count
+        }
+    }
+
+    return sizeModel{
+        categories: categories,
+        maxCount:   maxCount,
+    }
+}
+
+func (m sizeModel) View() string {
+    width, _, err := term.GetSize(int(os.Stdout.Fd()))
+    if err != nil {
+        width = 80 // Default if terminal width cannot be detected
+    }
+
+    var histogramBuilder strings.Builder
+    for _, category := range m.categories {
+        barLength := int(float64(width-30) * float64(category.Count) / float64(m.maxCount))
+        bar := strings.Repeat("█", barLength)
+
+        colorBar := "\033[33m" + bar + "\033[0m" // Color the bar
+        histogramBuilder.WriteString(fmt.Sprintf("%-20s %s %s PB\n", category.Label, colorBar, humanize.Comma(category.Count)))
+    }
+
+    return histogramBuilder.String()
+}
+
+// ...
+
+// Inside the function where you are ready to display the histogram:
+func displayHistogram() {
+    // Example size categories and counts in petabytes
+    categories := []sizeCategory{
+        {"<1MB", 50000},
+        {"1MB-1GB", 200000},
+        // ... other categories
+        {"1TB+", 100000},
+    }
+
+    // Initialize the Bubbletea model with the size data
+    model := newSizeModel(categories)
+    
+    // Create a new Bubbletea program
+    p := tea.NewProgram(model)
+    
+    // Render the histogram without starting the Bubbletea interactive loop
+    histogram, err := p.StartReturning()
+    if err != nil {
+        fmt.Printf("Error rendering histogram: %v", err)
+        return
+    }
+    
+    // Print the histogram
+    fmt.Println(histogram)
+}
+
+// ...
+
